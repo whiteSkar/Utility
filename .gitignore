@@ -164,6 +164,7 @@ cython_debug/
 # Data
 *.png
 *.csv
+*.json
 
 # IDE
 .idea/
