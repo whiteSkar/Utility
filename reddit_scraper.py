@@ -5,7 +5,7 @@ import gspread
 import csv
 import logging
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -20,6 +20,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive.file",
           "https://www.googleapis.com/auth/drive"]
 OAUTH_CREDENTIALS_FILE = 'google_credentials_oauth.json'
+STORAGE_HEADERS = ["date", "title", "post_content", "post_vote_count", "top_comment", "comment_vote_count", "url"]
 
 # Replace these with your own Reddit app credentials in praw.ini file
 reddit = praw.Reddit(
@@ -31,7 +32,8 @@ def get_posts_up_to_date(subreddit_name, min_upvotes, max_posts, storage):
     logging.info(f"Starting to scrape posts from subreddit: {subreddit_name}")
 
     # Check if the storage target exists and get the most recent post date if available
-    last_date_in_file = storage.get_last_post_date(subreddit_name)
+    filename = f"{subreddit_name}_{min_upvotes}"
+    last_date_in_file = storage.get_last_post_date(filename)
     if last_date_in_file:
         logging.info(f"Last post date found in storage: {last_date_in_file}")
     else:
@@ -46,13 +48,23 @@ def get_posts_up_to_date(subreddit_name, min_upvotes, max_posts, storage):
         end_timestamp = None  # No date limit if no date is found in the file
 
     posts = []
+    two_days_ago = datetime.utcnow() - timedelta(days=2)
     logging.info("Retrieving posts from Reddit...")
+
+    # Seems like it can only query about 1000 posts? That really sucks.
+    queried_post_count = 0
 
     # Use PRAW's `new` generator to paginate through posts
     for post in subreddit.new(limit=None):  # Pagination is handled automatically
+        queried_post_count += 1
+
         # Check if the post has enough upvotes and if the post's creation date is within the limit
         if post.score >= min_upvotes:
             post_created_time = post.created_utc
+
+            # Skip posts created within the last 2 days
+            if post_created_time >= two_days_ago.timestamp():
+                continue
 
             # Stop if the post is older than the end_date (if provided)
             if end_timestamp and post_created_time <= end_timestamp:
@@ -74,7 +86,8 @@ def get_posts_up_to_date(subreddit_name, min_upvotes, max_posts, storage):
                 "post_content": post.selftext,
                 "post_vote_count": post.score,
                 "top_comment": top_comment_body,
-                "comment_vote_count": top_comment_score
+                "comment_vote_count": top_comment_score,
+                "url": post.url,
             })
 
             logging.info(f"Retrieved post from date: {posts[-1]['date']}. Retrieved posts: {len(posts)}")
@@ -83,29 +96,29 @@ def get_posts_up_to_date(subreddit_name, min_upvotes, max_posts, storage):
                 logging.info(f"Reached the maximum number of posts to retrieve: {max_posts}")
                 break
 
+    logging.info(f"Queried a total of {queried_post_count} posts")
     posts.reverse()
 
     # Write the data to the selected storage method
     logging.info(f"Writing {len(posts)} posts to storage")
-    storage.write_posts(subreddit_name, posts)
+    storage.write_posts(filename, posts)
     logging.info("Finished writing posts to storage")
 
 
 class CSVStorage:
     @staticmethod
-    def get_last_post_date(subreddit_name):
+    def get_last_post_date(filename):
         """
         Check if the CSV file exists, and if so, return the date of the last entry in the file.
         """
-        filename = f"{subreddit_name}.csv"
-
         # Check if the file exists
-        if not os.path.isfile(filename):
+        filepath = filename + '.csv'
+        if not os.path.isfile(filepath):
             return None  # No file exists, so no date to return
 
         try:
             # Open the CSV and retrieve the last post date
-            with open(filename, mode="r", encoding="utf-8") as file:
+            with open(filepath, mode="r", encoding="utf-8") as file:
                 reader = csv.DictReader(file)
                 rows = list(reader)
                 if len(rows) == 0:
@@ -116,24 +129,20 @@ class CSVStorage:
             return None
 
     @staticmethod
-    def write_posts(subreddit_name, posts):
+    def write_posts(filename, posts):
         """
         Append posts to a CSV file. Create the file if it doesn't exist.
         """
-        filename = f"{subreddit_name}.csv"
-
-        # Define the column headers
-        headers = ["date", "title", "post_content", "post_vote_count", "top_comment", "comment_vote_count"]
-
         # Check if the file exists
-        file_exists = os.path.isfile(filename)
+        filepath = filename + '.csv'
+        file_exists = os.path.isfile(filepath)
 
         # Open the file in append mode
-        with open(filename, mode="a", newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=headers)
+        with open(filepath, mode="a", newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=STORAGE_HEADERS)
 
             # If the file does not exist or is empty, write the headers first
-            if not file_exists or os.stat(filename).st_size == 0:
+            if not file_exists or os.stat(filepath).st_size == 0:
                 writer.writeheader()
 
             # Write the post data to the CSV file
@@ -146,26 +155,26 @@ class GoogleSheetStorage:
         self._initialize_google_client()
         self.folder_id = self._setup_drive_directory()
 
-    def get_last_post_date(self, subreddit_name):
+    def get_last_post_date(self, filename):
         """
         Check if the Google Sheet exists in the specified folder, and if so, return the date of the last entry in the sheet.
         """
-        query = f"mimeType='application/vnd.google-apps.spreadsheet' and name='{subreddit_name}' and '{self.folder_id}' in parents and trashed=false"
+        query = f"mimeType='application/vnd.google-apps.spreadsheet' and name='{filename}' and '{self.folder_id}' in parents and trashed=false"
         results = self.drive_service.files().list(q=query, fields="files(id, name)").execute()
         items = results.get('files', [])
 
         if not items:
-            logging.info(f"Google Sheet for subreddit '{subreddit_name}' not found. Creating a new sheet.")
+            logging.info(f"Google Sheet with name '{filename}' not found. Creating a new sheet.")
             # If the sheet does not exist, create it in the specified folder
             file_metadata = {
-                'name': subreddit_name,
+                'name': filename,
                 'mimeType': 'application/vnd.google-apps.spreadsheet',
                 'parents': [self.folder_id]
             }
             sheet = self.drive_service.files().create(body=file_metadata, fields='id').execute()
             sheet_id = sheet.get('id')
             sheet = self.client.open_by_key(sheet_id).sheet1
-            sheet.append_row(["date", "title", "post_content", "post_vote_count", "top_comment", "comment_vote_count"])
+            sheet.append_row(STORAGE_HEADERS)
             return None
         else:
             # Open the existing sheet
@@ -176,26 +185,26 @@ class GoogleSheetStorage:
                 return None  # Sheet exists but is empty
             return records[-1]["date"]  # Return the date of the last entry
 
-    def write_posts(self, subreddit_name, posts):
+    def write_posts(self, filename, posts):
         """
         Append posts to a Google Sheet in the specified folder. Create the sheet if it doesn't exist.
         """
-        query = f"mimeType='application/vnd.google-apps.spreadsheet' and name='{subreddit_name}' and '{self.folder_id}' in parents and trashed=false"
+        query = f"mimeType='application/vnd.google-apps.spreadsheet' and name='{filename}' and '{self.folder_id}' in parents and trashed=false"
         results = self.drive_service.files().list(q=query, fields="files(id, name)").execute()
         items = results.get('files', [])
 
         if not items:
-            logging.info(f"Google Sheet for subreddit '{subreddit_name}' not found. Creating a new sheet.")
+            logging.info(f"Google Sheet with name '{filename}' not found. Creating a new sheet.")
             # Create the sheet in the specified folder
             file_metadata = {
-                'name': subreddit_name,
+                'name': filename,
                 'mimeType': 'application/vnd.google-apps.spreadsheet',
                 'parents': [self.folder_id]
             }
             sheet = self.drive_service.files().create(body=file_metadata, fields='id').execute()
             sheet_id = sheet.get('id')
             sheet = self.client.open_by_key(sheet_id).sheet1
-            sheet.append_row(["date", "title", "post_content", "post_vote_count", "top_comment", "comment_vote_count"])
+            sheet.append_row(STORAGE_HEADERS)
         else:
             sheet_id = items[0]['id']
             sheet = self.client.open_by_key(sheet_id).sheet1
@@ -204,7 +213,7 @@ class GoogleSheetStorage:
         for post in posts:
             sheet.append_row(
                 [post["date"], post["title"], post["post_content"], post["post_vote_count"], post["top_comment"],
-                 post["comment_vote_count"]])
+                 post["comment_vote_count"], post["url"]])
 
     def _initialize_google_client(self):
         """
@@ -268,3 +277,5 @@ if __name__ == "__main__":
 
     get_posts_up_to_date(subreddit_name=args.subreddit_name, min_upvotes=args.min_upvotes,
                          max_posts=args.max_posts, storage=storage)
+
+# TODO: Make it so that when changing the Headers, I don't have to change the implementations.
