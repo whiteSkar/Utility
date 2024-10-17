@@ -76,7 +76,7 @@ def get_posts_up_to_date(subreddit_name, min_upvotes, max_posts, storage):
             top_comment_score = 0
             if len(post.comments) > 0:
                 post.comments.replace_more(limit=0)  # Load all comments
-                top_comment = max(post.comments, key=lambda comment: comment.score)
+                top_comment = max(post.comments, key=lambda comment: comment.score if comment.body != '[deleted]' and comment.body != '[removed]' else 0)
                 top_comment_body = top_comment.body
                 top_comment_score = top_comment.score
 
